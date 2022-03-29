@@ -384,3 +384,32 @@
                 MyManager = BaseManager.from_queryset(MyQuerySet)
                 class MyModel(models.Model):
                     objects = MyManager()
+
+-   case: from_queryset_abstract_base_model
+    main: |
+        from myapp.models import ConcreteModel
+        reveal_type(ConcreteModel.objects)
+    installed_apps:
+        - myapp
+    files:
+        -   path: myapp/__init__.py
+        -   path: myapp/models.py
+            content: |
+                from django.db import models
+
+                class AbstractQuerySet(models.QuerySet):
+                    ...
+
+                AbstractManager = models.Manager.from_queryset(AbstractQuerySet)
+                class AbstractModel(models.Model):
+                    objects = AbstractManager()
+
+                    class Meta:
+                        abstract = True
+
+                class ConcreteQuerySet(AbstractQuerySet):
+                    ...
+
+                ConcreteManager = models.Manager.from_queryset(ConcreteQuerySet)
+                class ConcreteModel(AbstractModel):
+                    objects = ConcreteManager()
