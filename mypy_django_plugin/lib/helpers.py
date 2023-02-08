@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 from django.db.models.fields import Field
 from django.db.models.fields.related import RelatedField
@@ -33,7 +33,7 @@ from mypy.plugin import (
     SemanticAnalyzerPluginInterface,
 )
 from mypy.semanal import SemanticAnalyzer
-from mypy.types import AnyType, Instance, NoneTyp, TupleType
+from mypy.types import AnyType, Instance, NoneTyp, TupleType, get_proper_type, get_proper_types
 from mypy.types import Type as MypyType
 from mypy.types import TypedDictType, TypeOfAny, UnionType
 
@@ -197,15 +197,32 @@ def get_field_lookup_exact_type(api: TypeChecker, field: "Field[Any, Any]") -> M
     return get_private_descriptor_type(field_info, "_pyi_lookup_exact_type", is_nullable=field.null)
 
 
+def get_model_type_and_annotations_from_queryset(qs_instance: Instance) -> Tuple[Instance, Optional[TypedDictType]]:
+    """Given an instance, return type model type info and optionally a typed dict of annotations"""
+
+    for base in [qs_instance, *qs_instance.type.bases]:
+        if not base.args or not isinstance(base.args[0], Instance):
+            continue
+        instance = base.args[0]
+        if instance.type.fullname == fullnames.WITH_ANNOTATIONS_FULLNAME and len(instance.args) == 2:
+            model, annotations_dict = get_proper_types(instance.args)
+            if (
+                isinstance(model, Instance)
+                and model.type.has_base(fullnames.MODEL_CLASS_FULLNAME)
+                and isinstance(annotations_dict, TypedDictType)
+            ):
+                return model, annotations_dict
+        elif instance.type.has_base(fullnames.MODEL_CLASS_FULLNAME):
+            return instance, None
+
+    raise ValueError(f"Provided type is not a valid QuerySet type: {instance}")
+
+
 def get_nested_meta_node_for_current_class(info: TypeInfo) -> Optional[TypeInfo]:
     metaclass_sym = info.names.get("Meta")
     if metaclass_sym is not None and isinstance(metaclass_sym.node, TypeInfo):
         return metaclass_sym.node
     return None
-
-
-def is_annotated_model_fullname(model_cls_fullname: str) -> bool:
-    return model_cls_fullname.startswith(WITH_ANNOTATIONS_FULLNAME + "[")
 
 
 def create_type_info(name: str, module: str, bases: List[Instance]) -> TypeInfo:

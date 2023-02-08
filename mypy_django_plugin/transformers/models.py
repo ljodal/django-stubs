@@ -1,15 +1,24 @@
 from typing import Any, Dict, List, Optional, Type, Union, cast
 
+from mypy.errorcodes import ATTR_DEFINED
+
 from django.db.models import Manager, Model
 from django.db.models.fields import DateField, DateTimeField, Field
 from django.db.models.fields.related import ForeignKey
 from django.db.models.fields.reverse_related import ManyToManyRel, ManyToOneRel, OneToOneRel
 from mypy.checker import TypeChecker
-from mypy.nodes import ARG_STAR2, Argument, AssignmentStmt, CallExpr, Context, NameExpr, TypeInfo, Var
-from mypy.plugin import AnalyzeTypeContext, AttributeContext, CheckerPluginInterface, ClassDefContext
+from mypy.checkmember import analyze_member_access, report_missing_attribute
+from mypy.nodes import ARG_STAR2, Argument, AssignmentStmt, CallExpr, Context, MemberExpr, NameExpr, TypeInfo, Var
+from mypy.plugin import (
+    AnalyzeTypeContext,
+    AttributeContext,
+    CheckerPluginInterface,
+    ClassDefContext,
+    DynamicClassDefContext,
+)
 from mypy.plugins import common
 from mypy.semanal import SemanticAnalyzer
-from mypy.types import AnyType, Instance
+from mypy.types import AnyType, Instance, UnboundType, get_proper_types
 from mypy.types import Type as MypyType
 from mypy.types import TypedDictType, TypeOfAny, get_proper_type
 from mypy.typevars import fill_typevars
@@ -621,70 +630,92 @@ def handle_annotated_type(ctx: AnalyzeTypeContext, django_context: DjangoContext
     type_arg = ctx.api.analyze_type(args[0])
     api = cast(SemanticAnalyzer, ctx.api.api)  # type: ignore
 
+    # If the first argument isn't a model we just return the argument. This
+    # matches the default behaviour of mypy, which is to just strip the
+    # annotations.
     if not isinstance(type_arg, Instance) or not type_arg.type.has_base(MODEL_CLASS_FULLNAME):
+        print("First argument is not a model")
         return type_arg
 
-    fields_dict = None
-    if len(args) > 1:
-        second_arg_type = get_proper_type(ctx.api.analyze_type(args[1]))
-        if isinstance(second_arg_type, TypedDictType):
-            fields_dict = second_arg_type
-        elif isinstance(second_arg_type, Instance) and second_arg_type.type.fullname == ANNOTATIONS_FULLNAME:
-            annotations_type_arg = get_proper_type(second_arg_type.args[0])
-            if isinstance(annotations_type_arg, TypedDictType):
-                fields_dict = annotations_type_arg
-            elif not isinstance(annotations_type_arg, AnyType):
-                ctx.api.fail("Only TypedDicts are supported as type arguments to Annotations", ctx.context)
+    # The second argument must be a TypedDict instance, otherwise we ignore it
+    if len(args) < 2:
+        print("Has less than two args")
+        return type_arg
 
-    return get_or_create_annotated_type(api, type_arg, fields_dict=fields_dict)
+    fields_dict = get_proper_type(ctx.api.analyze_type(args[1]))
+    if not isinstance(fields_dict, TypedDictType):
+        print("Is not typed dict")
+        return type_arg
+
+    annotated_model_type = get_or_create_annotated_model_class(api, type_arg)
+    return Instance(annotated_model_type, [fields_dict])
 
 
-def get_or_create_annotated_type(
-    api: Union[SemanticAnalyzer, CheckerPluginInterface], model_type: Instance, fields_dict: Optional[TypedDictType]
-) -> Instance:
+def get_or_create_annotated_model_class(
+    api: Union[SemanticAnalyzer, TypeChecker], model_instance: Instance
+) -> TypeInfo:
+    """
+    Create a type for representing an annotated version of the given model
+    class. This is a model, by default annotated with _WithAnnotations, that
+    subclasses the model class and our special WithAnnotations class. The
+    created class essentially looks like this:
+
+    class MyModel__WithAnnotations(MyModel, WithAnnotations[_T], Generic[_T]):
+        pass
+
+    The _T type variable is a typeddict representing the annotated fields.
     """
 
-    Get or create the type for a model for which you getting/setting any attr is allowed.
+    module_name = model_instance.type.module_name
+    module = api.modules[module_name]
+    name = f"{model_instance.type.name}__WithAnnotations"
 
-    The generated type is an subclass of the model and django._AnyAttrAllowed.
-    The generated type is placed in the django_stubs_ext module, with the name WithAnnotations[ModelName].
-    If the user wanted to annotate their code using this type, then this is the annotation they would use.
-    This is a bit of a hack to make a pretty type for error messages and which would make sense for users.
-    """
-    model_module_name = "django_stubs_ext"
+    # Check if we've already created the class previously, and if so use that
+    type_info = helpers.lookup_fully_qualified_typeinfo(api, f"{module_name}.{name}")
+    if type_info and type_info.metadata.get("django", {}).get("with_annotations") is True:
+        return type_info
 
-    if helpers.is_annotated_model_fullname(model_type.type.fullname):
-        # If it's already a generated class, we want to use the original model as a base
-        model_type = model_type.type.bases[0]
+    with_annotations = helpers.lookup_fully_qualified_typeinfo(api, fullnames.WITH_ANNOTATIONS_FULLNAME)
+    assert with_annotations is not None
+    with_annotations_instance = fill_typevars(with_annotations)
+    assert isinstance(with_annotations_instance, Instance)
 
-    if fields_dict is not None:
-        type_name = f"WithAnnotations[{model_type.type.fullname.replace('.', '__')}, {fields_dict}]"
+    type_info = helpers.add_new_class_for_module(module, name, bases=[model_instance, with_annotations_instance])
+    type_info.type_vars = with_annotations.type_vars
+    type_info.defn.type_vars = with_annotations.defn.type_vars
+    type_info.metaclass_type = type_info.calculate_metaclass_type()
+    helpers.get_django_metadata(type_info)["with_annotations"] = True
+
+    return type_info
+
+
+def resolve_annotated_model_attribute(ctx: AttributeContext) -> MypyType:
+    if isinstance(ctx.context, MemberExpr):
+        attr_name = ctx.context.name
+    elif isinstance(ctx.context, CallExpr) and isinstance(ctx.context.callee, MemberExpr):
+        attr_name = ctx.context.callee.name
     else:
-        type_name = f"WithAnnotations[{model_type.type.fullname.replace('.', '__')}]"
+        ctx.api.fail(f'Cannot resolve the attribute of "{ctx.type}"', ctx.context, code=ATTR_DEFINED)
+        # TODO: More detailed message
+        cast(TypeChecker, ctx.api).note("Please report a bug to typed-django", ctx.context)
+        return AnyType(TypeOfAny.from_error)
 
-    annotated_typeinfo = helpers.lookup_fully_qualified_typeinfo(
-        cast(TypeChecker, api), model_module_name + "." + type_name
-    )
-    if annotated_typeinfo is None:
-        model_module_file = api.modules[model_module_name]  # type: ignore
+    # NOTE: I'm not sure how to trigger this, so it might be unnecesary
+    if not isinstance(ctx.type, Instance) or not len(ctx.type.args) == 1:
+        ctx.api.fail(f'Invalid "WithAnnotations" type, unable to resolve attributes', ctx.context)
+        return AnyType(TypeOfAny.from_error)
 
-        if isinstance(api, SemanticAnalyzer):
-            annotated_model_type = api.named_type_or_none(ANY_ATTR_ALLOWED_CLASS_FULLNAME, [])
-            assert annotated_model_type is not None
-        else:
-            annotated_model_type = api.named_generic_type(ANY_ATTR_ALLOWED_CLASS_FULLNAME, [])
+    annotations_dict, *_ = get_proper_types(ctx.type.args)
 
-        annotated_typeinfo = helpers.add_new_class_for_module(
-            model_module_file,
-            type_name,
-            bases=[model_type] if fields_dict is not None else [model_type, annotated_model_type],
-            fields=fields_dict.items if fields_dict is not None else None,
-            no_serialize=True,
-        )
-        if fields_dict is not None:
-            # To allow structural subtyping, make it a Protocol
-            annotated_typeinfo.is_protocol = True
-            # Save for later to easily find which field types were annotated
-            annotated_typeinfo.metadata["annotated_field_types"] = fields_dict.items
-    annotated_type = Instance(annotated_typeinfo, [])
-    return annotated_type
+    # If the accessed attribute is an annotated field return the type of that ...
+    if isinstance(annotations_dict, TypedDictType) and attr_name in annotations_dict.items:
+        typ = annotations_dict.items[attr_name]
+        return typ
+
+    # ... otherwise use the default mypy logic to handle the rest. As fields
+    # are descriptors, we don't want to implement the complex logic of
+    # resolving field types our selves.
+    if ctx.type.has_readable_member(attr_name):
+        return ctx.default_attr_type
+
+    return ctx.api.msg.has_no_attr(ctx.type, ctx.type, attr_name, ctx.context)

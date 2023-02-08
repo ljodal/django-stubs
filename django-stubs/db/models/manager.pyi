@@ -1,6 +1,6 @@
 import datetime
 from collections.abc import Collection, Iterable, Iterator, MutableMapping, Sequence
-from typing import Any, Generic, NoReturn, TypeVar, overload
+from typing import Any, Generic, Mapping, NoReturn, TypeVar, overload, type_check_only
 
 from _typeshed import Self
 from django.db.models import Combinable
@@ -166,3 +166,10 @@ class ManagerDescriptor:
 
 class EmptyManager(Manager[_T]):
     def __init__(self, model: type[_T]) -> None: ...
+
+_Annotations = TypeVar("_Annotations", covariant=True, bound=Mapping[str, Any])
+
+@type_check_only
+class WithAnnotations(Generic[_Annotations]):
+    def __getattr__(self, name: str) -> Any: ...
+    def __setattr__(self, __name: str, __value: Any) -> None: ...

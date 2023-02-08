@@ -98,15 +98,6 @@ class DjangoContext:
 
     def get_model_class_by_fullname(self, fullname: str) -> Optional[Type[Model]]:
         """Returns None if Model is abstract"""
-        annotated_prefix = WITH_ANNOTATIONS_FULLNAME + "["
-        if fullname.startswith(annotated_prefix):
-            # For our "annotated models", extract the original model fullname
-            fullname = fullname[len(annotated_prefix) :].rstrip("]")
-            if "," in fullname:
-                # Remove second type arg, which might be present
-                fullname = fullname[: fullname.index(",")]
-            fullname = fullname.replace("__", ".")
-
         module, _, model_cls_name = fullname.rpartition(".")
         for model_cls in self.model_modules.get(module, set()):
             if model_cls.__name__ == model_cls_name:

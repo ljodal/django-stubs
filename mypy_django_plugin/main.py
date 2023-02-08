@@ -12,10 +12,11 @@ from mypy.plugin import (
     ClassDefContext,
     DynamicClassDefContext,
     FunctionContext,
+    FunctionSigContext,
     MethodContext,
     Plugin,
 )
-from mypy.types import Type as MypyType
+from mypy.types import FunctionLike, Type as MypyType
 
 import mypy_django_plugin.transformers.orm_lookups
 from mypy_django_plugin.config import DjangoPluginConfig
@@ -32,6 +33,7 @@ from mypy_django_plugin.transformers.managers import (
 from mypy_django_plugin.transformers.models import (
     handle_annotated_type,
     process_model_class,
+    resolve_annotated_model_attribute,
     set_auth_user_model_boolean_fields,
 )
 from mypy_django_plugin.transformers.request import check_querydict_is_mutable
@@ -123,6 +125,7 @@ class NewSemanalDjangoPlugin(Plugin):
         return 10, module, -1
 
     def get_additional_deps(self, file: MypyFile) -> List[Tuple[int, str, int]]:
+
         # for settings
         if file.fullname == "django.conf" and self.django_context.django_settings_module:
             return [self._new_dependency(self.django_context.django_settings_module)]
@@ -165,8 +168,6 @@ class NewSemanalDjangoPlugin(Plugin):
                 if related_model_module != file.fullname:
                     deps.add(self._new_dependency(related_model_module))
         return list(deps) + [
-            # for QuerySet.annotate
-            self._new_dependency("django_stubs_ext"),
             # For BaseManager.from_queryset
             self._new_dependency("django.db.models.query"),
         ]
@@ -186,6 +187,10 @@ class NewSemanalDjangoPlugin(Plugin):
 
             if helpers.is_model_subclass_info(info, self.django_context):
                 return partial(init_create.redefine_and_typecheck_model_init, django_context=self.django_context)
+        return None
+
+    def get_function_signature_hook(self, fullname: str) -> Callable[[FunctionSigContext], FunctionLike] | None:
+        # print(f"get_function_signature_hook({fullname=})")
         return None
 
     def get_method_hook(self, fullname: str) -> Optional[Callable[[MethodContext], MypyType]]:
@@ -300,13 +305,16 @@ class NewSemanalDjangoPlugin(Plugin):
         if info and info.has_base(fullnames.STR_PROMISE_FULLNAME):
             return resolve_str_promise_attribute
 
+        if info and info.has_base(fullnames.WITH_ANNOTATIONS_FULLNAME):
+            return resolve_annotated_model_attribute
+
         return None
 
     def get_type_analyze_hook(self, fullname: str) -> Optional[Callable[[AnalyzeTypeContext], MypyType]]:
+
         if fullname in (
             "typing.Annotated",
             "typing_extensions.Annotated",
-            "django_stubs_ext.annotations.WithAnnotations",
         ):
             return partial(handle_annotated_type, django_context=self.django_context)
 

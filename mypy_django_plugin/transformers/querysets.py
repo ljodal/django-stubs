@@ -1,5 +1,7 @@
 from collections import OrderedDict
-from typing import Dict, List, Optional, Sequence, Type
+from typing import Dict, List, Optional, Sequence, Type, cast
+
+from mypy.checker import TypeChecker
 
 from django.core.exceptions import FieldError
 from django.db.models.base import Model
@@ -14,19 +16,7 @@ from mypy.types import TypedDictType, TypeOfAny, get_proper_type
 from mypy_django_plugin.django.context import DjangoContext, LookupsAreUnsupported
 from mypy_django_plugin.lib import fullnames, helpers
 from mypy_django_plugin.lib.fullnames import ANY_ATTR_ALLOWED_CLASS_FULLNAME
-from mypy_django_plugin.lib.helpers import is_annotated_model_fullname
-from mypy_django_plugin.transformers.models import get_or_create_annotated_type
-
-
-def _extract_model_type_from_queryset(queryset_type: Instance) -> Optional[Instance]:
-    for base_type in [queryset_type, *queryset_type.type.bases]:
-        if (
-            len(base_type.args)
-            and isinstance(base_type.args[0], Instance)
-            and base_type.args[0].type.has_base(fullnames.MODEL_CLASS_FULLNAME)
-        ):
-            return base_type.args[0]
-    return None
+from mypy_django_plugin.transformers.models import get_or_create_annotated_model_class
 
 
 def determine_proper_manager_type(ctx: FunctionContext) -> MypyType:
@@ -47,13 +37,11 @@ def get_field_type_from_lookup(
     *,
     method: str,
     lookup: str,
-    silent_on_error: bool = False,
 ) -> Optional[MypyType]:
     try:
         lookup_field = django_context.resolve_lookup_into_field(model_cls, lookup)
     except FieldError as exc:
-        if not silent_on_error:
-            ctx.api.fail(exc.args[0], ctx.context)
+        ctx.api.fail(exc.args[0], ctx.context)
         return None
     except LookupsAreUnsupported:
         return AnyType(TypeOfAny.explicit)
@@ -74,8 +62,8 @@ def get_values_list_row_type(
     ctx: MethodContext,
     django_context: DjangoContext,
     model_cls: Type[Model],
+    annotations: Optional[TypedDictType],
     *,
-    is_annotated: bool,
     flat: bool,
     named: bool,
 ) -> MypyType:
@@ -97,20 +85,11 @@ def get_values_list_row_type(
             for field in django_context.get_model_fields(model_cls):
                 column_type = django_context.get_field_get_type(typechecker_api, field, method="values_list")
                 column_types[field.attname] = column_type
-            if is_annotated:
-                # Return a NamedTuple with a fallback so that it's possible to access any field
-                return helpers.make_oneoff_named_tuple(
-                    typechecker_api,
-                    "Row",
-                    column_types,
-                    extra_bases=[typechecker_api.named_generic_type(ANY_ATTR_ALLOWED_CLASS_FULLNAME, [])],
-                )
-            else:
-                return helpers.make_oneoff_named_tuple(typechecker_api, "Row", column_types)
+            for name, field_type in annotations.items.items() if annotations else ():
+                column_types[name] = field_type
+            return helpers.make_oneoff_named_tuple(typechecker_api, "Row", column_types)
         else:
             # flat=False, named=False, all fields
-            if is_annotated:
-                return typechecker_api.named_generic_type("builtins.tuple", [AnyType(TypeOfAny.special_form)])
             field_lookups = []
             for field in django_context.get_model_fields(model_cls):
                 field_lookups.append(field.attname)
@@ -121,14 +100,12 @@ def get_values_list_row_type(
 
     column_types = OrderedDict()
     for field_lookup in field_lookups:
+        # TODO: Consider annotations
         lookup_field_type = get_field_type_from_lookup(
-            ctx, django_context, model_cls, lookup=field_lookup, method="values_list", silent_on_error=is_annotated
+            ctx, django_context, model_cls, lookup=field_lookup, method="values_list"
         )
         if lookup_field_type is None:
-            if is_annotated:
-                lookup_field_type = AnyType(TypeOfAny.from_omitted_generics)
-            else:
-                return AnyType(TypeOfAny.from_error)
+            return AnyType(TypeOfAny.from_error)
         column_types[field_lookup] = lookup_field_type
 
     if flat:
@@ -148,8 +125,9 @@ def extract_proper_type_queryset_values_list(ctx: MethodContext, django_context:
     default_return_type = get_proper_type(ctx.default_return_type)
     assert isinstance(default_return_type, Instance)
 
-    model_type = _extract_model_type_from_queryset(ctx.type)
-    if model_type is None:
+    try:
+        model_type, annotations_dict = helpers.get_model_type_and_annotations_from_queryset(ctx.type)
+    except ValueError:
         return AnyType(TypeOfAny.from_omitted_generics)
 
     model_cls = django_context.get_model_class_by_fullname(model_type.type.fullname)
@@ -158,13 +136,13 @@ def extract_proper_type_queryset_values_list(ctx: MethodContext, django_context:
 
     flat_expr = helpers.get_call_argument_by_name(ctx, "flat")
     if flat_expr is not None and isinstance(flat_expr, NameExpr):
-        flat = helpers.parse_bool(flat_expr)
+        flat = helpers.parse_bool(flat_expr) or False
     else:
         flat = False
 
     named_expr = helpers.get_call_argument_by_name(ctx, "named")
     if named_expr is not None and isinstance(named_expr, NameExpr):
-        named = helpers.parse_bool(named_expr)
+        named = helpers.parse_bool(named_expr) or False
     else:
         named = False
 
@@ -172,14 +150,7 @@ def extract_proper_type_queryset_values_list(ctx: MethodContext, django_context:
         ctx.api.fail("'flat' and 'named' can't be used together", ctx.context)
         return helpers.reparametrize_instance(default_return_type, [model_type, AnyType(TypeOfAny.from_error)])
 
-    # account for possible None
-    flat = flat or False
-    named = named or False
-
-    is_annotated = is_annotated_model_fullname(model_type.type.fullname)
-    row_type = get_values_list_row_type(
-        ctx, django_context, model_cls, is_annotated=is_annotated, flat=flat, named=named
-    )
+    row_type = get_values_list_row_type(ctx, django_context, model_cls, annotations_dict, flat=flat, named=named)
     return helpers.reparametrize_instance(default_return_type, [model_type, row_type])
 
 
@@ -206,29 +177,34 @@ def extract_proper_type_queryset_annotate(ctx: MethodContext, django_context: Dj
     default_return_type = get_proper_type(ctx.default_return_type)
     assert isinstance(default_return_type, Instance)
 
-    model_type = _extract_model_type_from_queryset(ctx.type)
-    if model_type is None:
-        return AnyType(TypeOfAny.from_omitted_generics)
+    try:
+        model_type, annotations_dict = helpers.get_model_type_and_annotations_from_queryset(ctx.type)
+    except ValueError:
+        # NOTE: Emit an error?
+        return ctx.default_return_type
 
-    api = ctx.api
+    api = cast(TypeChecker, ctx.api)
 
-    field_types = model_type.type.metadata.get("annotated_field_types")
+    field_types = annotations_dict.items if annotations_dict else None
+
     kwargs = gather_kwargs(ctx)
-    if kwargs:
-        # For now, we don't try to resolve the output_field of the field would be, but use Any.
-        added_field_types = {name: AnyType(TypeOfAny.implementation_artifact) for name, typ in kwargs.items()}
-        if field_types is not None:
-            # Annotate was called more than once, so add/update existing field types
-            field_types.update(added_field_types)
-        else:
-            field_types = added_field_types
+    if not kwargs:
+        api.note("Only keyword argument annotations are supported", ctx.context)
+        return ctx.default_return_type
 
-    fields_dict = None
+    # For now, we don't try to resolve the output_field of the field would be, but use Any.
+    added_field_types: dict[str, MypyType] = {
+        name: AnyType(TypeOfAny.implementation_artifact) for name, typ in kwargs.items()
+    }
     if field_types is not None:
-        fields_dict = helpers.make_typeddict(
-            api, fields=OrderedDict(field_types), required_keys=set(field_types.keys())
-        )
-    annotated_type = get_or_create_annotated_type(api, model_type, fields_dict=fields_dict)
+        # Annotate was called more than once, so add/update existing field types
+        field_types.update(added_field_types)
+    else:
+        field_types = added_field_types
+
+    fields_dict = helpers.make_typeddict(api, fields=OrderedDict(field_types), required_keys=set(field_types.keys()))
+    model_with_annotations = get_or_create_annotated_model_class(api, model_type)
+    annotated_type = Instance(model_with_annotations, [fields_dict])
 
     row_type: MypyType
     if len(default_return_type.args) > 1:
@@ -271,15 +247,13 @@ def extract_proper_type_queryset_values(ctx: MethodContext, django_context: Djan
     default_return_type = get_proper_type(ctx.default_return_type)
     assert isinstance(default_return_type, Instance)
 
-    model_type = _extract_model_type_from_queryset(ctx.type)
-    if model_type is None:
+    try:
+        model_type, annotations_dict = helpers.get_model_type_and_annotations_from_queryset(ctx.type)
+    except ValueError:
         return AnyType(TypeOfAny.from_omitted_generics)
 
     model_cls = django_context.get_model_class_by_fullname(model_type.type.fullname)
     if model_cls is None:
-        return default_return_type
-
-    if is_annotated_model_fullname(model_type.type.fullname):
         return default_return_type
 
     field_lookups = resolve_field_lookups(ctx.args[0], django_context)

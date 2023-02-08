@@ -5,7 +5,6 @@ from mypy.types import TypeOfAny
 
 from mypy_django_plugin.django.context import DjangoContext
 from mypy_django_plugin.lib import fullnames, helpers
-from mypy_django_plugin.lib.helpers import is_annotated_model_fullname
 
 
 def typecheck_queryset_filter(ctx: MethodContext, django_context: DjangoContext) -> MypyType:
@@ -20,8 +19,12 @@ def typecheck_queryset_filter(ctx: MethodContext, django_context: DjangoContext)
     if not ctx.type.args or not isinstance(ctx.type.args[0], Instance):
         return ctx.default_return_type
 
-    model_cls_fullname = ctx.type.args[0].type.fullname
-    model_cls = django_context.get_model_class_by_fullname(model_cls_fullname)
+    try:
+        model_type, annotations_dict = helpers.get_model_type_and_annotations_from_queryset(ctx.type)
+    except ValueError:
+        return ctx.default_return_type
+
+    model_cls = django_context.get_model_class_by_fullname(model_type.type.fullname)
     if model_cls is None:
         return ctx.default_return_type
 
@@ -34,10 +37,7 @@ def typecheck_queryset_filter(ctx: MethodContext, django_context: DjangoContext)
             provided_type = resolve_combinable_type(provided_type, django_context)
 
         lookup_type: MypyType
-        if is_annotated_model_fullname(model_cls_fullname):
-            lookup_type = AnyType(TypeOfAny.implementation_artifact)
-        else:
-            lookup_type = django_context.resolve_lookup_expected_type(ctx, model_cls, lookup_kwarg)
+        lookup_type = django_context.resolve_lookup_expected_type(ctx, model_cls, lookup_kwarg)
         # Managers as provided_type is not supported yet
         if isinstance(provided_type, Instance) and helpers.has_any_of_bases(
             provided_type.type, (fullnames.MANAGER_CLASS_FULLNAME, fullnames.QUERYSET_CLASS_FULLNAME)
