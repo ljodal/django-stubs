@@ -634,17 +634,14 @@ def handle_annotated_type(ctx: AnalyzeTypeContext, django_context: DjangoContext
     # matches the default behaviour of mypy, which is to just strip the
     # annotations.
     if not isinstance(type_arg, Instance) or not type_arg.type.has_base(MODEL_CLASS_FULLNAME):
-        print("First argument is not a model")
         return type_arg
 
     # The second argument must be a TypedDict instance, otherwise we ignore it
     if len(args) < 2:
-        print("Has less than two args")
         return type_arg
 
     fields_dict = get_proper_type(ctx.api.analyze_type(args[1]))
     if not isinstance(fields_dict, TypedDictType):
-        print("Is not typed dict")
         return type_arg
 
     annotated_model_type = get_or_create_annotated_model_class(api, type_arg)
